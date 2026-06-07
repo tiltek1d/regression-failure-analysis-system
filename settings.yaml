@@ -1,0 +1,58 @@
+app:
+  log_level: INFO
+  output_dir: "./results"
+
+stand:
+  test_results_dir: "//network/drive/test_results"
+  etalon_dir: "//network/drive/etalons"
+  timeout: 120
+
+cleaning:
+  remove_fields:
+    - timestamp
+    - sn
+    - seq
+    - service_host
+    - thread
+    - logger
+    - process
+    - dump
+    - format
+    - span_id
+    - parent_id
+    - stacktrace
+    - service_ephemeral_id
+    - event
+    - refs
+    - attributes
+  kafka_keep_levels:
+    - ERROR
+    - WARNING
+  clickhouse_keep_levels:
+    - ERROR
+    - WARNING
+
+masking:
+  enabled: true
+  keep_start: 2
+  keep_end: 2
+  sensitive_fields: []
+
+llm:
+  endpoint: "http://ollama.company.local:11434/api/generate"
+  model: "corporate-log-analyzer"
+  timeout: 300
+  # prompt_template можно определить отдельно или оставить пустым для встроенного
+
+cause_analysis:
+  llm:
+    endpoint: "http://ollama-2.local:11434/api/generate"
+    model: "corporate-reasoning-13b"
+    timeout: 300
+
+report:
+  llm:
+    endpoint: "http://ollama-2.local:11434/api/generate"
+    model: "corporate-reasoning-13b"
+    timeout: 300
+  send_to_llm: true
