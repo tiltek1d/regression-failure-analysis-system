@@ -1,169 +1,326 @@
-"""
-Скрипт для генерации реалистичного лога работы анализатора регрессии.
-Запустите его, чтобы получить вывод консоли, который можно использовать для отчёта.
-"""
-
+import argparse
+import json
 import logging
 import sys
 import time
-import random
-from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
-# Настройка формата лога как в основном приложении
-LOG_FORMAT = "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
+import yaml
+from tqdm import tqdm
 
-def setup_logging():
+from data_preprocessing.cleaner import LogCleaner
+from data_preprocessing.masker import DataMasker
+from data_preprocessing.splitter import TaskSplitter
+from clients.llm_client import LLMComparatorClient
+from clients.llm_cause_analyzer import LLMCauseAnalyzer
+from builder.diff_builder import DiffBuilder
+from builder.report_builder import ReportBuilder
+from utils.utils import parse_test_name
+
+# Настройка логирования
+def setup_logging(level: str):
     logger = logging.getLogger()
-    logger.setLevel(logging.INFO)
-    handler = logging.StreamHandler(sys.stdout)
-    formatter = logging.Formatter(LOG_FORMAT, datefmt=DATE_FORMAT)
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
-    return logger
+    logger.setLevel(level.upper())
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
 
-def simulate_delay(mean=0.1):
-    """Небольшая случайная задержка для правдоподобия временных меток."""
-    time.sleep(random.uniform(0.05, mean))
+
+def load_config(config_path: str) -> dict:
+    with open(config_path, 'r', encoding='utf-8') as f:
+        return yaml.safe_load(f)
+
+def find_file_pairs(test_dir: str, etalon_dir: str, package_filter: Optional[str] = None) -> List[Tuple[str, Path, Path]]:
+    test_path = Path(test_dir)
+    etalon_path = Path(etalon_dir)
+    if not test_path.is_dir():
+        raise FileNotFoundError(f"Директория тестов не найдена: {test_dir}")
+    if not etalon_path.is_dir():
+        raise FileNotFoundError(f"Директория эталонов не найдена: {etalon_dir}")
+
+    test_files = {}
+    etalon_files = {}
+
+    for f in test_path.glob('*.json'):
+        name, _ = parse_test_name(f.name)
+        if not name:
+            logging.warning(f"Не удалось извлечь имя теста из {f.name}")
+            continue
+        if package_filter and package_filter not in name:
+            continue
+        if name in test_files:
+            logging.warning(f"Дубликат теста {name}, используется последний")
+        test_files[name] = f
+
+    for f in etalon_path.glob('*.json'):
+        name, _ = parse_test_name(f.name)
+        if not name:
+            logging.warning(f"Не удалось извлечь имя теста из эталона {f.name}")
+            continue
+        if package_filter and package_filter not in name:
+            continue
+        if name in etalon_files:
+            logging.warning(f"Дубликат эталона {name}, используется последний")
+        etalon_files[name] = f
+
+    pairs = []
+    for name, tf in test_files.items():
+        if name in etalon_files:
+            pairs.append((name, tf, etalon_files[name]))
+        else:
+            logging.warning(f"Для теста {name} не найден эталон")
+    for name in etalon_files:
+        if name not in test_files:
+            logging.warning(f"Для эталона {name} нет тестового файла")
+    return pairs
+
+
+def load_json(file_path: Path) -> List[Dict]:
+    with open(file_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    if not isinstance(data, list):
+        if isinstance(data, dict):
+            for v in data.values():
+                if isinstance(v, list):
+                    return v
+        raise ValueError(f"Файл {file_path} не содержит список логов")
+    return data
+
+
+def process_test(test_name: str, test_file: Path, etalon_file: Path,
+                 cleaner: LogCleaner, masker: DataMasker,
+                 splitter: TaskSplitter, llm: LLMComparatorClient,
+                 diff_builder: DiffBuilder, output_dir: Path) -> Optional[Path]:
+    start_time = time.time()
+    logging.info(f"=== Обработка теста: {test_name} ===")
+    try:
+        test_log = load_json(test_file)
+        etalon_log = load_json(etalon_file)
+        logging.info(f"Загружено записей: тест {len(test_log)}, эталон {len(etalon_log)}")
+
+        test_clean = cleaner.clean(test_log)
+        etalon_clean = cleaner.clean(etalon_log)
+        logging.info(f"После очистки: тест {len(test_clean)}, эталон {len(etalon_clean)}")
+
+        test_masked = masker.mask(test_clean)
+        etalon_masked = masker.mask(etalon_clean)
+
+        # Получаем упорядоченные списки задач
+        test_tasks = splitter.split(test_masked)   # list of (task_id, [entries])
+        etalon_tasks = splitter.split(etalon_masked)
+        logging.info(f"Найдено task: тест {len(test_tasks)}, эталон {len(etalon_tasks)}")
+
+        max_len = max(len(test_tasks), len(etalon_tasks))
+        task_comparisons = []
+        unmatched_etalon = []
+        unmatched_test = []
+
+        # Проходим по индексам задач
+        for idx in tqdm(range(max_len), desc=f"Tasks {test_name}", unit="pair"):
+            if idx < len(etalon_tasks):
+                et_id, et_entries = etalon_tasks[idx]
+            else:
+                et_id, et_entries = None, None
+
+            if idx < len(test_tasks):
+                test_id, test_entries = test_tasks[idx]
+            else:
+                test_id, test_entries = None, None
+
+            if et_entries is None and test_entries is None:
+                continue
+
+            # Ситуация: задача только в эталоне
+            if test_entries is None:
+                unmatched_etalon.append(et_id)
+                continue
+            # Ситуация: задача только в тесте
+            if et_entries is None:
+                unmatched_test.append(test_id)
+                continue
+
+            # Обе задачи есть – вызываем LLM
+            try:
+                comparison = llm.compare_tasks(et_id, test_id, et_entries, test_entries)
+                task_comparisons.append({
+                    "task_index": idx,
+                    "etalon_task_id": et_id,
+                    "test_task_id": test_id,
+                    "comparison": comparison
+                })
+            except Exception as e:
+                logging.error(f"Ошибка сравнения пары task (etalon={et_id}, test={test_id}): {e}")
+                task_comparisons.append({
+                    "task_index": idx,
+                    "etalon_task_id": et_id,
+                    "test_task_id": test_id,
+                    "comparison": {"operations": [], "error": str(e)}
+                })
+
+        # Сборка итогового diff
+        result = diff_builder.build(
+            test_name,
+            task_comparisons,
+            unmatched_etalon,
+            unmatched_test
+        )
+
+        output_path = output_dir / f"log_{test_name}_diff.json"
+        with open(output_path, 'w', encoding='utf-8') as f:
+            json.dump(result, f, ensure_ascii=False, indent=2)
+
+        elapsed = time.time() - start_time
+        logging.info(f"Тест {test_name} готов за {elapsed:.1f} с -> {output_path}")
+        return output_path
+
+    except Exception as e:
+        logging.error(f"Критическая ошибка при обработке {test_name}: {e}", exc_info=True)
+        return None
 
 def main():
-    logger = setup_logging()
-    start_time = datetime.now() - timedelta(minutes=random.randint(3, 7))
+    parser = argparse.ArgumentParser(description='Анализатор развала регрессии (полный цикл)')
+    parser.add_argument('--config', default='settings.yaml', help='Путь к YAML конфигурации')
+    parser.add_argument('--test-dir', help='Папка с JSON-файлами результатов теста')
+    parser.add_argument('--etalon-dir', help='Папка с эталонными JSON-файлами')
+    parser.add_argument('--output-dir', help='Папка для сохранения результатов')
+    parser.add_argument('--package', help='Фильтр по имени пакета (подстрока)')
+    parser.add_argument('--log-level', help='Уровень логирования')
+    parser.add_argument('--skip-diff', action='store_true', help='Пропустить этап сравнения (diff)')
+    parser.add_argument('--skip-cause', action='store_true', help='Пропустить этап анализа причин')
+    parser.add_argument('--skip-report', action='store_true', help='Пропустить этап построения сводного отчёта')
+    args = parser.parse_args()
 
-    # Инициализация временной метки
-    log_time = start_time
-    def log(level, msg, name="__main__"):
-        nonlocal log_time
-        log_time += timedelta(seconds=random.uniform(0.1, 0.5))
-        record = logging.LogRecord(name, level, "", 0, msg, None, None)
-        handler = logging.StreamHandler(sys.stdout)
-        handler.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=DATE_FORMAT))
-        # вручную устанавливаем время
-        record.created = log_time.timestamp()
-        record.msecs = (log_time.microsecond // 1000) * 0.001
-        handler.emit(record)
+    config = load_config(args.config)
+    app_cfg = config.get('app', {})
+    stand_cfg = config.get('stand', {})
+    cleaning_cfg = config.get('cleaning', {})
+    masking_cfg = config.get('masking', {})
+    llm_cfg = config.get('llm', {})
+    cause_cfg = config.get('cause_analysis', {}).get('llm', {})
+    report_cfg = config.get('report', {})
 
-    log(logging.INFO, "=== Запуск анализатора регрессии ===")
+    log_level = args.log_level or app_cfg.get('log_level', 'INFO')
+    test_dir = args.test_dir or stand_cfg.get('test_results_dir')
+    etalon_dir = args.etalon_dir or stand_cfg.get('etalon_dir')
+    output_dir = Path(args.output_dir or app_cfg.get('output_dir', './results'))
 
-    # Загрузка конфигурации
-    log(logging.INFO, "Загрузка конфигурации из settings.yaml")
-    log(logging.DEBUG, "Конфигурация загружена: app.output_dir=./results, log_level=INFO", "__main__")
+    if not test_dir or not etalon_dir:
+        print("Не указаны директории тестов и эталонов. Проверьте конфиг или аргументы.")
+        sys.exit(1)
 
-    # Поиск файлов
-    log(logging.INFO, "Поиск файлов тестов и эталонов...", "root")
-    # Имитация поиска
-    test_dir = "/mnt/test_logs"
-    etalon_dir = "/mnt/etalon_logs"
-    test_names = [
-        "acquiring.ATMP2PLimits",
-        "acquiring.ATMOurOtherCardP2PFee",
-        "acquiring.ATMOtherOtherCardP2PFee",
-        "acquiring.ATMCashWithdrawalMCFee",
-        "acquiring.ATMNoteAcceptanceMCFee",
-        "issuing.DebitProductsOtherPosCashLimits",
-        "issuing.DebitProductsOtherATMLimits",
-        "issuing.DebitProductsOtherPosCashLimits",
-        "issuing.NontransactionFees",
-        "issuing.AllowedATMOperationsH2H"
-    ]
-    missing_etalon_for = ["issuing.DebitProductsOtherPosCashLimits"]  # дубликат в списке, один пропущен?
-    # Сделаем так, что для "issuing.DebitProductsOtherPosCashLimits" эталон не найден (предупреждение)
-    # и для "acquiring.ATMNoteAcceptanceMCFee" нет тестового файла (warning)
-    for name in test_names:
-        if name == missing_etalon_for[0]:
-            log(logging.WARNING, f"Для теста {name} не найден эталонный файл, пропущен", "root")
-        elif name == "acquiring.ATMNoteAcceptanceMCFee":
-            log(logging.WARNING, f"Для эталона {name} нет тестового файла, пропущен", "root")
-        else:
-            log(logging.INFO, f"Найдена пара: {name}", "root")
+    setup_logging(log_level)
+    logging.info("=== Запуск анализатора регрессии ===")
 
-    pairs = [name for name in test_names if name not in missing_etalon_for and name != "acquiring.ATMNoteAcceptanceMCFee"]
-    log(logging.INFO, f"Найдено {len(pairs)} пар для обработки")
+    # Инициализация компонентов этапа 1 (diff)
+    cleaner = LogCleaner(
+        remove_fields=cleaning_cfg.get('remove_fields', []),
+        kafka_keep_levels=cleaning_cfg.get('kafka_keep_levels', ['ERROR', 'WARNING']),
+        clickhouse_keep_levels=cleaning_cfg.get('clickhouse_keep_levels', ['ERROR', 'WARNING'])
+    )
+    masker = DataMasker(
+        enabled=masking_cfg.get('enabled', True),
+        sensitive_fields=masking_cfg.get('sensitive_fields', []),
+        keep_start=masking_cfg.get('keep_start', 2),
+        keep_end=masking_cfg.get('keep_end', 2)
+    )
+    splitter = TaskSplitter(task_field='task_id')
+    diff_llm = LLMComparatorClient(
+        endpoint=llm_cfg['endpoint'],
+        model=llm_cfg['model'],
+        timeout=llm_cfg.get('timeout', 300),
+        prompt_template=llm_cfg.get('prompt_template')
+    )
+    diff_builder = DiffBuilder()
 
-    # Инициализация компонентов
-    log(logging.INFO, "Инициализация компонентов: LogCleaner, DataMasker, TaskSplitter, LLMClient")
-    log(logging.DEBUG, "LogCleaner: remove_fields=[timestamp,sn,seq,...], kafka_keep_levels=['ERROR','WARNING'], clickhouse_keep_levels=['ERROR','WARNING']", "cleaner")
-    log(logging.DEBUG, "DataMasker: enabled=True, sensitive_fields=[...]", "masker")
-    log(logging.INFO, "LLM клиент для diff настроен: endpoint=http://ai-sandbox.openintegration.local:11434/api/generate, model=diff-analyzer-7b", "llm_client")
+    output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Поиск пар файлов
+    pairs = find_file_pairs(test_dir, etalon_dir, args.package)
+    logging.info(f"Найдено пар для анализа: {len(pairs)}")
+    if not pairs:
+        logging.warning("Нет подходящих пар файлов. Завершение.")
+        return
+
+    diff_files: List[Path] = []
     # Этап 1: Diff
-    log(logging.INFO, "=== ЭТАП 1: Сравнение (diff) ===")
-    for idx, test_name in enumerate(pairs):
-        log(logging.INFO, f"=== Обработка теста: {test_name} ===")
-        # Загрузка
-        test_entries = random.randint(1200, 2500)
-        etalon_entries = random.randint(1100, 2400)
-        log(logging.INFO, f"Загружено записей: тест - {test_entries}, эталон - {etalon_entries}", "__main__")
-
-        # Очистка
-        removed_test = random.randint(50, 200)
-        removed_etalon = random.randint(40, 180)
-        log(logging.INFO, f"Удалено записей: {removed_test}", "cleaner")
-        log(logging.INFO, f"После очистки: тест - {test_entries - removed_test} записей, эталон - {etalon_entries - removed_etalon}", "cleaner")
-        log(logging.DEBUG, "Пропущена запись без поля task_id", "splitter")
-
-        # Маскирование
-        log(logging.INFO, "Маскирование выполнено", "masker")
-
-        # Разделение на task
-        test_tasks_cnt = random.randint(5, 12)
-        etalon_tasks_cnt = random.randint(5, 13)
-        log(logging.INFO, f"Найдено task: тест - {test_tasks_cnt}, эталон - {etalon_tasks_cnt}", "splitter")
-
-        # Обработка пар task
-        max_tasks = max(test_tasks_cnt, etalon_tasks_cnt)
-        for task_idx in range(max_tasks):
-            et_id = random.randint(1000, 9999)
-            test_id = random.randint(1000, 9999)
-            if task_idx >= test_tasks_cnt:
-                log(logging.WARNING, f"Task с индексом {task_idx} отсутствует в тестовом прогоне (только в эталоне: {et_id})", "__main__")
-            elif task_idx >= etalon_tasks_cnt:
-                log(logging.WARNING, f"Task с индексом {task_idx} отсутствует в эталоне (только в тесте: {test_id})", "__main__")
-            else:
-                # вызов LLM
-                latency = round(random.uniform(1.2, 3.5), 2)
-                tokens = random.randint(200, 600)
-                log(logging.INFO, f"LLM запрос для пары task (etalon={et_id}, test={test_id}) выполнен за {latency}с", "llm_client")
-                log(logging.DEBUG, f"Использовано токенов: {tokens}", "llm_client")
-        # Завершение теста
-        elapsed_test = round(random.uniform(8, 20), 2)
-        log(logging.INFO, f"Тест {test_name} готов за {elapsed_test} с -> ./results/log_{test_name}_diff.json", "__main__")
+    if not args.skip_diff:
+        logging.info("=== ЭТАП 1: Сравнение (diff) ===")
+        for name, t_file, e_file in pairs:
+            diff_path = process_test(name, t_file, e_file,
+                                     cleaner, masker, splitter,
+                                     diff_llm, diff_builder, output_dir)
+            if diff_path:
+                diff_files.append(diff_path)
+        logging.info(f"Создано diff-файлов: {len(diff_files)}")
+    else:
+        # Если diff пропущен, ищем существующие diff-файлы в output_dir по именам тестов
+        for name, _, _ in pairs:
+            candidate = output_dir / f"log_{name}_diff.json"
+            if candidate.exists():
+                diff_files.append(candidate)
+        logging.info(f"Найдено готовых diff-файлов: {len(diff_files)}")
 
     # Этап 2: Анализ причин
-    log(logging.INFO, "=== ЭТАП 2: Анализ причин ===")
-    cause_model = "corporate-reasoning-13b"
-    log(logging.INFO, f"Инициализация CauseAnalyzer: endpoint=http://ollama-2.local:11434/api/generate, model={cause_model}", "cause_analyzer")
-    cause_files = []
-    for test_name in pairs:
-        # cause анализ
-        latency_cause = round(random.uniform(2.0, 5.0), 2)
-        tokens_cause = random.randint(400, 900)
-        log(logging.INFO, f"Анализ причин для {test_name} выполнен за {latency_cause}с", "cause_analyzer")
-        log(logging.DEBUG, f"Токенов: {tokens_cause}", "cause_analyzer")
-        cause_path = f"./results/log_{test_name}_cause.json"
-        log(logging.INFO, f"Причины сохранены: {cause_path}", "__main__")
-        cause_files.append(cause_path)
+    cause_files: List[Path] = []
+    if not args.skip_cause:
+        if not diff_files:
+            logging.error("Нет diff-файлов, этап анализа причин невозможен.")
+        else:
+            if not cause_cfg:
+                logging.error("Не настроена LLM для анализа причин (cause_analysis.llm)")
+            else:
+                logging.info("=== ЭТАП 2: Анализ причин ===")
+                cause_analyzer = LLMCauseAnalyzer(
+                    endpoint=cause_cfg['endpoint'],
+                    model=cause_cfg['model'],
+                    timeout=cause_cfg.get('timeout', 300),
+                    prompt_template=cause_cfg.get('prompt_template')
+                )
+                for diff_file in diff_files:
+                    try:
+                        cause_result = cause_analyzer.analyze(diff_file)
+                        test_name = cause_result.get('test_name', diff_file.stem)
+                        cause_path = output_dir / f"log_{test_name}_cause.json"
+                        with open(cause_path, 'w', encoding='utf-8') as f:
+                            json.dump(cause_result, f, ensure_ascii=False, indent=2)
+                        cause_files.append(cause_path)
+                        logging.info(f"Причины сохранены: {cause_path}")
+                    except Exception as e:
+                        logging.error(f"Не удалось проанализировать причины для {diff_file}: {e}")
+    else:
+        # Ищем существующие cause-файлы
+        for diff_file in diff_files:
+            test_name = diff_file.stem.replace('_diff', '')
+            candidate = output_dir / f"log_{test_name}_cause.json"
+            if candidate.exists():
+                cause_files.append(candidate)
+        logging.info(f"Найдено готовых файлов с причинами: {len(cause_files)}")
 
-    # Этап 3: Сводный отчет
-    log(logging.INFO, "=== ЭТАП 3: Построение сводного отчёта ===")
-    log(logging.INFO, "Агрегирование 8 файлов с причинами", "report_builder")
-    agg_path = "./results/regression_report_aggregated.json"
-    log(logging.INFO, f"Агрегированные причины сохранены в {agg_path}", "report_builder")
+    # Этап 3: Сводный отчёт
+    if not args.skip_report:
+        if not cause_files:
+            logging.warning("Нет файлов с причинами, этап отчёта пропущен.")
+        else:
+            logging.info("=== ЭТАП 3: Построение сводного отчёта ===")
+            report_llm_cfg = report_cfg.get('llm', {})
+            send_to_llm = report_cfg.get('send_to_llm', True)
+            report_builder = ReportBuilder(
+                endpoint=report_llm_cfg.get('endpoint') if send_to_llm else None,
+                model=report_llm_cfg.get('model') if send_to_llm else None,
+                timeout=report_llm_cfg.get('timeout', 300),
+                prompt_template=report_llm_cfg.get('prompt_template'),
+                send_to_llm=send_to_llm
+            )
+            report_output = output_dir / "regression_report.json"
+            try:
+                final = report_builder.build(cause_files, report_output)
+                logging.info(f"Итоговый отчёт: {report_output}")
+            except Exception as e:
+                logging.error(f"Ошибка при создании отчёта: {e}")
 
-    # Финальный LLM запрос
-    final_latency = round(random.uniform(3.0, 6.0), 2)
-    final_tokens = random.randint(600, 1200)
-    log(logging.INFO, f"Финальный метаанализ выполнен за {final_latency}с, использовано токенов: {final_tokens}", "report_builder")
-    report_path = "./results/regression_report.json"
-    log(logging.INFO, f"Финальный отчёт сохранён в {report_path}", "report_builder")
+    logging.info("=== Работа анализатора завершена ===")
 
-    # Итог
-    total_elapsed = round(random.uniform(50, 90), 2)
-    log(logging.INFO, f"Готово: обработано {len(pairs)}/{len(test_names)} тестов за {total_elapsed} с.", "__main__")
-    log(logging.INFO, "=== Работа анализатора завершена ===")
-
-    # Дополнительно статистика
-    log(logging.INFO, "Статистика: успешно создано diff-файлов: 8, cause-файлов: 8, отчётов: 2 (агрегированный и финальный)", "__main__")
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
